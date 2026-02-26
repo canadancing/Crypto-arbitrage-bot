@@ -1,0 +1,111 @@
+exchanges:
+  - name: binance
+    enabled: true
+    env_key: BINANCE_API_KEY
+    env_secret: BINANCE_API_SECRET
+    thresholds:
+      min_negative_funding_rate_daily: 0.20
+      min_positive_funding_rate_daily: 0.005
+      min_net_edge_daily: 0.05
+      max_spread_percent: 0.70
+    position:
+      max_position_size_usd: 200
+      max_position_size_percent: 30
+      max_concurrent_positions: 6
+      leverage: 1
+    risk:
+      daily_loss_limit_percent: 5.0
+      margin_ratio_threshold: 70
+      margin_ratio_target: 50
+      min_hold_time_seconds: 3600
+      funding_exit_threshold: 0.1
+    scan:
+      top_coins_to_scan: 100
+      scan_interval_seconds: 60
+      position_check_interval_seconds: 30
+      max_attempts_per_cycle: 3
+    execution:
+      use_limit_orders: false
+      limit_order_offset_percent: 0.05
+      order_timeout_seconds: 10
+      est_fee_percent: 0.08
+    borrow:
+      enable_reverse_carry: true
+      borrow_snipe_timeout_seconds: 20
+      borrow_poll_intervals_seconds: [1, 2, 5, 10]
+      borrow_precheck_cooldown_seconds: 1800
+      reverse_partial_fill_enabled: true
+      reverse_partial_fill_min_ratio: 0.35
+      reverse_pause_after_no_inventory_count: 9
+      reverse_pause_seconds: 3600
+      prioritize_positive_carry: true
+    filters:
+      quote_currency: USDT
+      whitelist_enabled: false
+      whitelist: []
+      blacklist:
+        - LUNAUSDT
+        - LUNCUSDT
+
+  - name: gateio
+    enabled: true
+    env_key: GATEIO_API_KEY
+    env_secret: GATEIO_API_SECRET
+    unified_account: true
+    thresholds:
+      min_negative_funding_rate_daily: 0.20
+      min_positive_funding_rate_daily: 0.02
+      min_net_edge_daily: 0.02
+      max_spread_percent: 0.70
+    position:
+      max_position_size_usd: 200
+      max_position_size_percent: 30
+      max_concurrent_positions: 15
+      leverage: 1
+    risk:
+      daily_loss_limit_percent: 5.0
+      margin_ratio_threshold: 70
+      margin_ratio_target: 45
+      min_hold_time_seconds: 1800
+      funding_exit_threshold: 0.1
+    scan:
+      top_coins_to_scan: 100
+      scan_interval_seconds: 45
+      position_check_interval_seconds: 20
+      max_attempts_per_cycle: 10
+    execution:
+      use_limit_orders: true
+      limit_order_offset_percent: 0.03
+      order_timeout_seconds: 8
+      est_fee_percent: 0.10
+    borrow:
+      enable_reverse_carry: false
+      borrow_snipe_timeout_seconds: 20
+      borrow_poll_intervals_seconds: [1, 2, 5, 10]
+      borrow_precheck_cooldown_seconds: 1800
+      reverse_partial_fill_enabled: false
+      reverse_partial_fill_min_ratio: 0.35
+      reverse_pause_after_no_inventory_count: 12
+      reverse_pause_seconds: 3600
+      prioritize_positive_carry: true
+    filters:
+      quote_currency: USDT
+      whitelist_enabled: false
+      whitelist: []
+      blacklist:
+        - LUNA_USDT
+        - LUNC_USDT
+
+notifications:
+  telegram_enabled: true
+  heartbeat_interval_minutes: 60
+
+dashboard:
+  host: 127.0.0.1
+  port: 8787
+
+runtime:
+  dry_run: false
+  close_positions_on_shutdown: true
+  log_file: logs/bot.log
+  paper_equity_usd: 1000
