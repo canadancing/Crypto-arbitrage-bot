@@ -64,25 +64,155 @@ class ExchangeArbBot:
         self._status_equity = 0.0
         self._status_spot_equity = 0.0
         self._status_futures_equity = 0.0
+        self._status_futures_equity = 0.0
         self._exchange_open_positions: list[dict[str, Any]] = []
+        self._recent_errors: list[dict[str, Any]] = []
         self.history = HistoryStore()
+        self._startup_step_timeout_seconds = 30.0
+        self._status_refresh_timeout_seconds = 12.0
+
+    def _estimate_funding_window_payout_usd(self, size_usd: float, daily_rate: float) -> float:
+        per_window_rate = abs(float(daily_rate)) / 3.0 / 100.0
+        return float(size_usd) * per_window_rate
+
+    async def _run_startup_step(self, label: str, coro: Any, timeout: float | None = None) -> None:
+        timeout = timeout or self._startup_step_timeout_seconds
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"[{self.name}] Startup step timed out after {timeout:.0f}s: {label}. Continuing."
+            )
+        except Exception as e:
+            self.logger.warning(f"[{self.name}] Startup step failed: {label}: {e}")
+
+    async def _estimate_reverse_borrow_qty(
+        self,
+        symbol: str,
+        size_usd: float,
+        spot_price: float,
+    ) -> float:
+        if size_usd <= 0 or spot_price <= 0:
+            return 0.0
+
+        contract_size = await self.client.get_contract_size(symbol)
+        if contract_size <= 0:
+            return 0.0
+
+        fut_symbol = self.client._futures_symbol(symbol)
+        spot_symbol = self.client._spot_symbol(symbol)
+        target_base_qty = size_usd / spot_price
+        futures_qty = await self.client.round_qty(
+            fut_symbol,
+            target_base_qty / contract_size,
+        )
+        if futures_qty <= 0:
+            return 0.0
+
+        borrow_qty = await self.client.round_qty(
+            spot_symbol,
+            futures_qty * contract_size,
+        )
+        return float(max(0.0, borrow_qty))
+
+    async def _reverse_inventory_plan(
+        self,
+        symbol: str,
+        requested_size_usd: float,
+        spot_price: float,
+        borrowable_cache: dict[str, float],
+    ) -> dict[str, float | bool]:
+        required_borrow_qty = await self._estimate_reverse_borrow_qty(
+            symbol,
+            requested_size_usd,
+            spot_price,
+        )
+        if required_borrow_qty <= 0:
+            return {
+                "ok": False,
+                "required_borrow_qty": 0.0,
+                "available_borrow_qty": 0.0,
+                "effective_borrow_qty": 0.0,
+                "effective_size_usd": 0.0,
+                "min_borrow_qty": 0.0,
+            }
+
+        base_asset = self.client._base_asset(symbol)
+        if base_asset not in borrowable_cache:
+            borrowable_cache[base_asset] = await self.client.get_borrowable(base_asset)
+        available_borrow_qty = float(borrowable_cache.get(base_asset, 0.0))
+
+        spot_symbol = self.client._spot_symbol(symbol)
+        effective_borrow_qty = await self.client.round_qty(
+            spot_symbol,
+            min(required_borrow_qty, available_borrow_qty),
+        )
+        min_ratio = (
+            float(self.config.borrow.reverse_partial_fill_min_ratio)
+            if self.config.borrow.reverse_partial_fill_enabled
+            else 1.0
+        )
+        min_borrow_qty = required_borrow_qty * min_ratio
+        effective_size_usd = float(effective_borrow_qty) * float(spot_price)
+
+        return {
+            "ok": float(effective_borrow_qty) >= min_borrow_qty and float(effective_borrow_qty) > 0,
+            "required_borrow_qty": float(required_borrow_qty),
+            "available_borrow_qty": float(available_borrow_qty),
+            "effective_borrow_qty": float(effective_borrow_qty),
+            "effective_size_usd": float(effective_size_usd),
+            "min_borrow_qty": float(min_borrow_qty),
+        }
+
+    def _find_unclosed_history_open(self, symbol: str, strategy: str) -> dict[str, Any] | None:
+        rows = self.history.read_all()
+        closed_ids = {
+            row.get("position_id")
+            for row in rows
+            if row.get("exchange") == self.name
+            and row.get("symbol") == symbol
+            and row.get("strategy") == strategy
+            and row.get("event") in ("CLOSE", "CLOSE_FORCED")
+        }
+        for row in reversed(rows):
+            if (
+                row.get("exchange") == self.name
+                and row.get("symbol") == symbol
+                and row.get("strategy") == strategy
+                and row.get("event") == "OPEN"
+                and row.get("position_id") not in closed_ids
+            ):
+                return row
+        return None
 
     async def initialize(self) -> None:
         """Initialize equity and leverage defaults."""
-        equity = await self.client.get_total_equity()
+        equity = 0.0
+        try:
+            equity = await asyncio.wait_for(
+                self.client.get_total_equity(),
+                timeout=self._status_refresh_timeout_seconds,
+            )
+        except Exception as e:
+            self.logger.warning(f"[{self.name}] Could not fetch starting equity promptly: {e}")
+
         self._status_equity = equity
         self.safety.set_starting_equity(equity)
         self.logger.info(
             f"[{self.name}] Initialized — equity: ${equity:,.2f}, "
             f"dry_run: {self.dry_run}"
         )
-        await self.notifier.send(
-            f"🚀 <b>[{self.name.capitalize()}]</b> Bot started\n"
-            f"Equity: ${equity:,.2f} | Dry run: {self.dry_run}"
+        await self._run_startup_step(
+            "startup notification",
+            self.notifier.send(
+                f"🚀 <b>[{self.name.capitalize()}]</b> Bot started\n"
+                f"Equity: ${equity:,.2f} | Dry run: {self.dry_run}"
+            ),
+            timeout=10.0,
         )
-        await self._refresh_live_status(force=True)
-        await self._adopt_existing_positions()
-        await self._cleanup_orphan_spots()
+        await self._run_startup_step("initial live status refresh", self._refresh_live_status(force=True))
+        await self._run_startup_step("adopt existing positions", self._adopt_existing_positions())
+        await self._run_startup_step("cleanup orphan spots", self._cleanup_orphan_spots())
 
     async def _adopt_existing_positions(self) -> None:
         """Detect and adopt pre-existing exchange positions for monitoring.
@@ -155,6 +285,8 @@ class ExchangeArbBot:
 
             base_asset = self.client._base_asset(symbol)
             futures_base_qty = abs(contracts) * contract_size
+            history_open = self._find_unclosed_history_open(symbol, strategy)
+            est_fees = notional * 2 * (self.config.execution.est_fee_percent / 100)
 
             if strategy == "positive_carry":
                 # Match with spot holdings
@@ -169,14 +301,14 @@ class ExchangeArbBot:
                 position = {
                     "symbol": symbol,
                     "strategy": "positive_carry",
-                    "size_usd": notional,
-                    "entry_time": time.time(),
-                    "spot_entry_price": spot_price,
-                    "futures_entry_price": futures_price,
+                    "size_usd": float(history_open.get("size_usd", notional)) if history_open else notional,
+                    "entry_time": float(history_open.get("entry_time", time.time())) if history_open else time.time(),
+                    "spot_entry_price": float(history_open.get("spot_entry_price", spot_price)) if history_open else spot_price,
+                    "futures_entry_price": float(history_open.get("futures_entry_price", futures_price)) if history_open else futures_price,
                     "spot_qty": spot_qty,
                     "futures_qty": abs(contracts),
                     "futures_base_qty": futures_base_qty,
-                    "est_fees": 0,
+                    "est_fees": float(history_open.get("est_fees", est_fees)) if history_open else est_fees,
                     "_adopted": True,
                 }
             else:
@@ -184,15 +316,15 @@ class ExchangeArbBot:
                 position = {
                     "symbol": symbol,
                     "strategy": "reverse_carry",
-                    "size_usd": notional,
-                    "entry_time": time.time(),
-                    "spot_entry_price": spot_price,
-                    "futures_entry_price": futures_price,
+                    "size_usd": float(history_open.get("size_usd", notional)) if history_open else notional,
+                    "entry_time": float(history_open.get("entry_time", time.time())) if history_open else time.time(),
+                    "spot_entry_price": float(history_open.get("spot_entry_price", spot_price)) if history_open else spot_price,
+                    "futures_entry_price": float(history_open.get("futures_entry_price", futures_price)) if history_open else futures_price,
                     "borrow_qty": futures_base_qty,
                     "borrow_asset": base_asset,
                     "futures_qty": abs(contracts),
                     "futures_base_qty": futures_base_qty,
-                    "est_fees": 0,
+                    "est_fees": float(history_open.get("est_fees", est_fees)) if history_open else est_fees,
                     "_adopted": True,
                 }
 
@@ -290,14 +422,23 @@ class ExchangeArbBot:
             return
         self._last_live_refresh = now
         try:
-            self._status_equity = await self.client.get_total_equity()
-            breakdown = await self.client.get_equity_breakdown()
+            self._status_equity = await asyncio.wait_for(
+                self.client.get_total_equity(),
+                timeout=self._status_refresh_timeout_seconds,
+            )
+            breakdown = await asyncio.wait_for(
+                self.client.get_equity_breakdown(),
+                timeout=self._status_refresh_timeout_seconds,
+            )
             self._status_spot_equity = breakdown["spot"]
             self._status_futures_equity = breakdown["futures"]
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[{self.name}] Live equity refresh skipped: {e}")
         try:
-            live = await self.client.get_futures_positions()
+            live = await asyncio.wait_for(
+                self.client.get_futures_positions(),
+                timeout=self._status_refresh_timeout_seconds,
+            )
             mapped: list[dict[str, Any]] = []
             for p in live:
                 contracts = float(
@@ -326,8 +467,8 @@ class ExchangeArbBot:
                     }
                 )
             self._exchange_open_positions = mapped
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[{self.name}] Live position refresh skipped: {e}")
 
     async def scan_and_trade(self) -> dict[str, Any]:
         """One scan cycle: find opportunities and execute trades."""
@@ -344,6 +485,7 @@ class ExchangeArbBot:
         max_attempts = self.config.scan.max_attempts_per_cycle
         equity = await self.client.get_total_equity()
         opened = 0
+        borrowable_cache: dict[str, float] = {}
 
         for opp in opportunities:
             if self._scan_attempt_count >= max_attempts:
@@ -367,7 +509,12 @@ class ExchangeArbBot:
                 continue
 
             net_threshold = self.config.thresholds.min_net_edge_daily
+            if self.safety.is_cautious_mode():
+                net_threshold = self.config.risk.cautious_min_net_edge_daily
+
             if net_edge < net_threshold:
+                if self.safety.is_cautious_mode():
+                    self.logger.debug(f"[{self.name}] Skipped {symbol} - Cautious mode requires {net_threshold}% edge")
                 continue
 
             # Skip if reverse carry disabled or paused
@@ -381,17 +528,6 @@ class ExchangeArbBot:
                     continue
             else:
                 if self.positive_carry.is_paused():
-                    continue
-
-            # Prioritize positive carry
-            if self.config.borrow.prioritize_positive_carry and not is_positive:
-                # Check if there are still positive carry opportunities ahead
-                remaining_positive = any(
-                    o["daily_rate"] > self.config.thresholds.min_positive_funding_rate_daily
-                    for o in opportunities[opportunities.index(opp)+1:]
-                    if o["daily_rate"] > 0
-                )
-                if remaining_positive:
                     continue
 
             # Skip if we already hold this position, to avoid log spam and API calls
@@ -413,6 +549,39 @@ class ExchangeArbBot:
             size_usd = (equity * 0.80) / max(max_slots, 1)
             size_usd = min(size_usd, self.config.position.max_position_size_usd)
             size_usd = max(size_usd, 5.0)  # never open a position smaller than $5
+            if not is_positive:
+                reverse_plan = await self._reverse_inventory_plan(
+                    symbol,
+                    size_usd,
+                    spot_price,
+                    borrowable_cache,
+                )
+                if reverse_plan["required_borrow_qty"] <= 0:
+                    self.logger.info(
+                        f"[{self.name}] {symbol} skipped: reverse carry sizing rounded to 0"
+                    )
+                    continue
+                if not reverse_plan["ok"]:
+                    self.logger.info(
+                        f"[{self.name}] {symbol} skipped: borrowable "
+                        f"{reverse_plan['available_borrow_qty']:.6f} < minimum "
+                        f"{reverse_plan['min_borrow_qty']:.6f} {self.client._base_asset(symbol)} "
+                        f"(full size {reverse_plan['required_borrow_qty']:.6f})"
+                    )
+                    continue
+                size_usd = max(5.0, float(reverse_plan["effective_size_usd"]))
+
+            # Only prefer positive carry over reverse carry when that reverse trade
+            # is intentionally deprioritized by config and still fully executable.
+            if self.config.borrow.prioritize_positive_carry and not is_positive:
+                remaining_positive = any(
+                    o["daily_rate"] > self.config.thresholds.min_positive_funding_rate_daily
+                    for o in opportunities[opportunities.index(opp)+1:]
+                    if o["daily_rate"] > 0
+                )
+                if remaining_positive:
+                    continue
+
             is_valid, messages = self.safety.validate_trade(
                 symbol, size_usd, spot_price, futures_price,
             )
@@ -421,11 +590,32 @@ class ExchangeArbBot:
                     self.logger.info(f"[{self.name}] {symbol} rejected: {msg}")
                 continue
 
+            expected_funding_per_window_usd = self._estimate_funding_window_payout_usd(
+                size_usd,
+                daily_rate,
+            )
+            profit_buffer = float(self.config.risk.profit_buffer_usd)
+            max_windows = max(1, int(self.config.risk.max_funding_windows_to_profit))
+            windows_to_buffer = (
+                profit_buffer / expected_funding_per_window_usd
+                if expected_funding_per_window_usd > 0
+                else float("inf")
+            )
+            if windows_to_buffer > max_windows:
+                self.logger.info(
+                    f"[{self.name}] {symbol} skipped: expected funding "
+                    f"${expected_funding_per_window_usd:.4f}/8h needs "
+                    f"{windows_to_buffer:.1f} windows to clear "
+                    f"${profit_buffer:.2f} buffer (max {max_windows})"
+                )
+                continue
+
             self._scan_attempt_count += 1
 
             self.logger.info(
                 f"[{self.name}] 🎯 Opportunity: {symbol} "
-                f"{daily_rate:+.2f}%/day (net ~{net_edge:+.2f}%) → {strategy_name}"
+                f"{daily_rate:+.2f}%/day (net ~{net_edge:+.2f}%) → {strategy_name} "
+                f"{'[CAUTIOUS]' if self.safety.is_cautious_mode() else ''}"
             )
 
             # Execute
@@ -443,6 +633,9 @@ class ExchangeArbBot:
                 opened += 1
                 position_id = f"{self.name}:{symbol}:{position.get('entry_time', time.time())}"
                 position["position_id"] = position_id
+                position["entry_daily_rate"] = daily_rate
+                position["expected_funding_per_window_usd"] = expected_funding_per_window_usd
+                position["estimated_windows_to_profit_buffer"] = windows_to_buffer
                 self.positions.append(position)
                 self.safety.add_position(position)
                 self.position_monitor.add_position(position)
@@ -459,6 +652,10 @@ class ExchangeArbBot:
                     "spot_qty": position.get("spot_qty"),
                     "futures_qty": position.get("futures_qty"),
                     "borrow_qty": position.get("borrow_qty"),
+                    "est_fees": position.get("est_fees"),
+                    "entry_daily_rate": daily_rate,
+                    "expected_funding_per_window_usd": expected_funding_per_window_usd,
+                    "estimated_windows_to_profit_buffer": windows_to_buffer,
                     "dry_run": self.dry_run,
                 })
                 await self.notifier.send_trade_alert(
@@ -517,6 +714,8 @@ class ExchangeArbBot:
                     "pnl": result.get("pnl", 0),
                     "spot_pnl": result.get("spot_pnl", 0),
                     "futures_pnl": result.get("futures_pnl", 0),
+                    "funding_fee": result.get("funding_fee", 0),
+                    "trading_fee": result.get("trading_fee", 0),
                     "dry_run": self.dry_run,
                     "close_reason": status.get("reason", "unknown"),
                 })
@@ -530,11 +729,26 @@ class ExchangeArbBot:
                 # loop forever. Manual review of the exchange position is advised.
                 position["_close_attempts"] = position.get("_close_attempts", 0) + 1
                 if position["_close_attempts"] >= 3:
-                    self.logger.error(
-                        f"[{self.name}] {symbol} failed to close after "
-                        f"{position['_close_attempts']} attempts — force-removing from "
-                        f"tracking. Please verify the position manually on the exchange."
+                    error_msg = (
+                        f"🚨 CRITICAL: Failed to close {symbol} after {position['_close_attempts']} attempts. "
+                        f"Forced removed from tracking. Please verify and manually close spot/futures to avoid unhedged losses."
                     )
+                    self.logger.error(f"[{self.name}] {error_msg}")
+                    
+                    # 1. Send Telegram Alert
+                    asyncio.create_task(self.notifier.send_error(self.name, error_msg))
+                    
+                    # 2. Append to persistent dashboard errors
+                    self._recent_errors.append({
+                        "symbol": symbol,
+                        "strategy": strategy,
+                        "time": time.time(),
+                        "message": f"Failed to close after 3 attempts. Manual intervention required."
+                    })
+                    # Keep only the last 10 errors
+                    if len(self._recent_errors) > 10:
+                        self._recent_errors.pop(0)
+
                     self.positions.remove(position)
                     self.safety.remove_position(symbol)
                     self.position_monitor.remove_position(symbol)
@@ -636,9 +850,16 @@ class ExchangeArbBot:
             "futures_equity": self._status_futures_equity,
             "loss_limit_exceeded": not self.safety.is_within_daily_loss_limit(),
             "open_positions": open_positions,
+            "recent_errors": self._recent_errors,
         }
 
     async def get_status_async(self) -> dict[str, Any]:
         """Refresh live exchange snapshot before returning status."""
-        await self._refresh_live_status(force=True)
+        try:
+            await asyncio.wait_for(
+                self._refresh_live_status(force=True),
+                timeout=self._status_refresh_timeout_seconds + 1.0,
+            )
+        except Exception as e:
+            self.logger.debug(f"[{self.name}] Async status refresh skipped: {e}")
         return self.get_status()

@@ -152,7 +152,7 @@ def _read_history(limit: int = 1000) -> list[dict[str, Any]]:
 
 
 def _history_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    closes = [r for r in rows if r.get("event") == "CLOSE"]
+    closes = [r for r in rows if r.get("event") in ("CLOSE", "CLOSE_FORCED")]
     total_pnl = sum(float(r.get("pnl", 0) or 0) for r in closes)
     wins = sum(1 for r in closes if float(r.get("pnl", 0) or 0) > 0)
     losses = sum(1 for r in closes if float(r.get("pnl", 0) or 0) < 0)
@@ -205,6 +205,7 @@ def collect_analytics() -> dict[str, Any]:
     # Read yesterday's equity from server-side snapshots
     yesterday_asset = None
     daily_change = None
+    snapshots = {}
     try:
         with open(EQUITY_SNAPSHOT_PATH, encoding="utf-8") as f:
             snapshots = json.load(f)
@@ -214,6 +215,21 @@ def collect_analytics() -> dict[str, Any]:
             daily_change = today_asset - yesterday_asset
     except Exception:
         pass
+        
+    # Replace historical PnLs with true snapshot differences if available
+    if snapshots:
+        sorted_snap_days = sorted(snapshots.keys())
+        for i in range(1, len(sorted_snap_days)):
+            prev_day = sorted_snap_days[i-1]
+            curr_day = sorted_snap_days[i]
+            daily_pnl_map[curr_day] = snapshots[curr_day] - snapshots[prev_day]
+            
+    # Always set today's pnl to live daily_change if we have it
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    if daily_change is not None:
+        daily_pnl_map[today_str] = daily_change
+    elif today_asset is not None and yesterday_asset is not None:
+        daily_pnl_map[today_str] = today_asset - yesterday_asset
     
     # Build graph_data: one entry per day, sorted ascending
     graph_data = []
@@ -272,9 +288,9 @@ def snapshot_equity() -> None:
         # Always update today's value (latest reading)
         snapshots[today_str] = total_equity
         
-        # Keep only last 7 days
+        # Keep only last 30 days
         sorted_keys = sorted(snapshots.keys())
-        while len(sorted_keys) > 7:
+        while len(sorted_keys) > 30:
             del snapshots[sorted_keys.pop(0)]
         
         with open(EQUITY_SNAPSHOT_PATH, "w", encoding="utf-8") as f:

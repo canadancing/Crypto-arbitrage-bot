@@ -28,6 +28,12 @@ class SafetyChecker:
     def is_within_daily_loss_limit(self) -> bool:
         return not self._daily_loss_exceeded
 
+    def is_cautious_mode(self) -> bool:
+        if self.starting_equity <= 0:
+            return False
+        pnl_pct = (self.daily_pnl / self.starting_equity) * 100
+        return pnl_pct <= -self.config.risk.cautious_mode_trigger_percent
+
     def update_pnl(self, pnl_change: float) -> bool:
         """Update daily PnL. Returns False if daily loss limit exceeded."""
         self.daily_pnl += pnl_change
@@ -62,10 +68,15 @@ class SafetyChecker:
             return False, f"Already have an active position for {symbol}"
         if self.starting_equity > 0:
             pct = (size_usd / self.starting_equity) * 100
-            if pct > self.config.position.max_position_size_percent:
+            
+            max_pct = self.config.position.max_position_size_percent
+            if self.is_cautious_mode():
+                max_pct = self.config.risk.cautious_max_position_size_percent
+                
+            if pct > max_pct:
                 return False, (
-                    f"Position {pct:.1f}% of equity exceeds max "
-                    f"{self.config.position.max_position_size_percent}%"
+                    f"Position {pct:.1f}% of equity exceeds max {max_pct}% "
+                    f"({'CAUTIOUS MODE' if self.is_cautious_mode() else 'normal'})"
                 )
         return True, "Position size checks passed"
 

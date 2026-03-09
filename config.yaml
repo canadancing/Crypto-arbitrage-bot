@@ -17,8 +17,14 @@ exchanges:
       daily_loss_limit_percent: 5.0
       margin_ratio_threshold: 70
       margin_ratio_target: 50
-      min_hold_time_seconds: 3600
-      funding_exit_threshold: 0.1
+      min_hold_time_seconds: 7200
+      funding_interval_seconds: 28800
+      max_funding_windows_to_profit: 12
+      funding_exit_threshold: 0.005
+      profit_buffer_usd: 0.05
+      require_funding_fee_buffer: true
+      stale_recycle_enabled: false
+      target_roi_percent: 0.50
     scan:
       top_coins_to_scan: 100
       scan_interval_seconds: 60
@@ -38,7 +44,7 @@ exchanges:
       reverse_partial_fill_min_ratio: 0.35
       reverse_pause_after_no_inventory_count: 9
       reverse_pause_seconds: 3600
-      prioritize_positive_carry: true
+      prioritize_positive_carry: false
     filters:
       quote_currency: USDT
       whitelist_enabled: false
@@ -66,8 +72,14 @@ exchanges:
       daily_loss_limit_percent: 5.0
       margin_ratio_threshold: 70
       margin_ratio_target: 45
-      min_hold_time_seconds: 1800
-      funding_exit_threshold: 0.1
+      min_hold_time_seconds: 7200
+      funding_interval_seconds: 28800
+      max_funding_windows_to_profit: 6
+      funding_exit_threshold: 0.005
+      profit_buffer_usd: 0.10
+      require_funding_fee_buffer: true
+      stale_recycle_enabled: false
+      target_roi_percent: 0.50
     scan:
       top_coins_to_scan: 100
       scan_interval_seconds: 45

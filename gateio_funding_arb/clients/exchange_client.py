@@ -32,11 +32,13 @@ class ExchangeClient:
         self.name = config.name
         self.logger = logger or logging.getLogger(f"client.{self.name}")
         self._precision_cache: dict[str, dict[str, Any]] = {}
+        self._income_cache: dict[tuple[str, int], dict[str, Any]] = {}
         self._request_count = 0
         self._last_request_time = 0.0
         self._equity_cache_value: float | None = None
         self._equity_cache_ts: float = 0.0
         self._request_timeout_seconds = 20
+        self._income_cache_ttl_seconds = 60
 
         exchange_cls = getattr(ccxt, self.EXCHANGE_MAP[self.name])
         common_opts: dict[str, Any] = {
@@ -184,10 +186,18 @@ class ExchangeClient:
         ticker = await self._retry(self.spot_exchange.fetch_ticker, spot_sym)
         return float(ticker["last"])
 
+    async def get_spot_ticker(self, symbol: str) -> dict[str, Any]:
+        spot_sym = self._spot_symbol(symbol)
+        return await self._retry(self.spot_exchange.fetch_ticker, spot_sym)
+
     async def get_futures_price(self, symbol: str) -> float:
         fut_sym = self._futures_symbol(symbol)
         ticker = await self._retry(self.futures_exchange.fetch_ticker, fut_sym)
         return float(ticker["last"])
+
+    async def get_futures_ticker(self, symbol: str) -> dict[str, Any]:
+        fut_sym = self._futures_symbol(symbol)
+        return await self._retry(self.futures_exchange.fetch_ticker, fut_sym)
 
     async def get_funding_rate(self, symbol: str) -> dict[str, float]:
         """Get current funding rate for a symbol.
@@ -274,47 +284,71 @@ class ExchangeClient:
         spot_sym = self._spot_symbol(symbol)
         qty = await self.round_qty(spot_sym, qty)
         self.logger.info(f"[{self.name}] BUY spot {qty} {spot_sym}")
-        gate_params = {"unifiedAccount": True} if (self.name == "gateio" and self.config.unified_account) else {}
+        gate_params: dict[str, Any] = {"unifiedAccount": True} if (self.name == "gateio" and self.config.unified_account) else {}
+        
+        order = None
         if use_limit:
             price = await self.get_spot_price(symbol)
             price *= 1 + self.config.execution.limit_order_offset_percent / 100
             price = await self.round_price(spot_sym, price)
-            return await self._retry(
+            order = await self._retry(
                 self.spot_exchange.create_limit_buy_order, spot_sym, qty, price, gate_params,
             )
-        if self.name == "gateio":
+        elif self.name == "gateio":
             # Gate expects market buy in quote-cost terms; use cost route first.
             spot_px = await self.get_spot_price(symbol)
             cost = max(0.01, round(qty * spot_px, 6))
             try:
-                return await self._retry(
+                order = await self._retry(
                     self.spot_exchange.create_market_buy_order_with_cost, spot_sym, cost, gate_params
                 )
             except Exception:
                 # Fallback: aggressive near-market IOC-like limit buy.
                 price = await self.round_price(spot_sym, spot_px * 1.005)
-                return await self._retry(
+                # Gateio requires time-in-force for IOC sometimes, ccxt handles params
+                gate_params["timeInForce"] = "IOC"
+                order = await self._retry(
                     self.spot_exchange.create_limit_buy_order, spot_sym, qty, price, gate_params,
                 )
-        return await self._retry(
-            self.spot_exchange.create_market_buy_order, spot_sym, qty, gate_params,
-        )
+        else:
+            order = await self._retry(
+                self.spot_exchange.create_market_buy_order, spot_sym, qty, gate_params,
+            )
+            
+        # Verify order actually filled or is live
+        if order:
+            status = order.get("status", "").lower()
+            filled = float(order.get("filled", 0) or 0)
+            if status in ["canceled", "rejected", "failed"] and filled <= 0:
+                raise Exception(f"Order instantly failed/canceled by exchange without filling: {order}")
+        return order
 
     async def sell_spot(self, symbol: str, qty: float, use_limit: bool = False) -> dict[str, Any]:
         spot_sym = self._spot_symbol(symbol)
         qty = await self.round_qty(spot_sym, qty)
         self.logger.info(f"[{self.name}] SELL spot {qty} {spot_sym}")
         gate_params = {"unifiedAccount": True} if (self.name == "gateio" and self.config.unified_account) else {}
+        
+        order = None
         if use_limit:
             price = await self.get_spot_price(symbol)
             price *= 1 - self.config.execution.limit_order_offset_percent / 100
             price = await self.round_price(spot_sym, price)
-            return await self._retry(
+            order = await self._retry(
                 self.spot_exchange.create_limit_sell_order, spot_sym, qty, price, gate_params,
             )
-        return await self._retry(
-            self.spot_exchange.create_market_sell_order, spot_sym, qty, gate_params,
-        )
+        else:
+            order = await self._retry(
+                self.spot_exchange.create_market_sell_order, spot_sym, qty, gate_params,
+            )
+            
+        # Verify order actually filled or is live
+        if order:
+            status = order.get("status", "").lower()
+            filled = float(order.get("filled", 0) or 0)
+            if status in ["canceled", "rejected", "failed"] and filled <= 0:
+                raise Exception(f"Order instantly failed/canceled by exchange without filling: {order}")
+        return order
 
     # ── futures orders ──────────────────────────────────────────────
 
@@ -426,12 +460,11 @@ class ExchangeClient:
     # ── balances & account ──────────────────────────────────────────
 
     async def get_spot_balance(self, asset: str = "USDT") -> dict[str, float]:
-        # For Gate.io unified accounts the spot and futures share one balance pool.
-        # The legacy spot endpoint (type=spot) returns only the classic spot sub-account
-        # (~empty), and omitting type causes timeouts.  Use the futures/swap endpoint
-        # (which works and already has unifiedAccount=True support) as the source of truth.
-        if self.name == "gateio" and self.config.unified_account:
+        # For Gate.io unified accounts, USDT is shared in the unified margin pool (swap endpoint).
+        # However, altcoins physically reside in the classic spot endpoint namespace.
+        if self.name == "gateio" and self.config.unified_account and asset == "USDT":
             return await self.get_futures_balance(asset)
+            
         params: dict[str, Any] = {}
         if self.name == "gateio":
             params["type"] = "spot"
@@ -494,15 +527,14 @@ class ExchangeClient:
                 futures_pnl = float(details.get("futures", {}).get("unrealised_pnl", 0) or 0)
                 futures_eq = futures_amt + futures_pnl
                 
-                # Gate.io has 'finance', 'delivery', etc. We roll everything non-futures into 'spot'
-                # to ensure Spot + Futures = Total
-                spot = max(0.0, total_eq - futures_eq)
-                
                 # The user wants "Futures" replaced with "Free USDT" for Gate.io in the UI.
-                # We fetch spot available USDT and pass it under the "futures" key,
-                # letting the UI rename the label based on the exchange.
+                # We fetch spot available USDT and pass it under the "futures" key
                 spot_balance = await self._retry(self.spot_exchange.fetch_balance)
                 free_usdt = float(spot_balance.get("USDT", {}).get("free", 0) or 0)
+                
+                # To ensure Spot + USDT = Total Equity in the UI, we assign the remaining
+                # equity to "spot". This represents altcoins, hedge value, locked margin, etc.
+                spot = max(0.0, total_eq - free_usdt)
                 
                 return {"spot": spot, "futures": free_usdt}
             except Exception:
@@ -562,6 +594,75 @@ class ExchangeClient:
         except Exception as e:
             self.logger.warning(f"[{self.name}] Could not fetch futures positions: {e}")
             return []
+
+    async def get_position_income_summary(
+        self,
+        symbol: str,
+        entry_time: float | None = None,
+    ) -> dict[str, float]:
+        """Return funding/fee income for an open position since entry."""
+        if self.name == "gateio":
+            return await self._get_gateio_position_income_summary(symbol)
+        if self.name == "binance":
+            return await self._get_binance_position_income_summary(symbol, entry_time)
+        return {"funding_fee": 0.0, "trading_fee": 0.0}
+
+    async def _get_gateio_position_income_summary(self, symbol: str) -> dict[str, float]:
+        live_positions = await self._retry(self.futures_exchange.fetch_positions, [symbol])
+        if not live_positions:
+            return {"funding_fee": 0.0, "trading_fee": 0.0}
+        ex_pos = live_positions[0]
+        return {
+            "funding_fee": float(ex_pos.get("info", {}).get("pnl_fund", 0) or 0.0),
+            "trading_fee": float(ex_pos.get("info", {}).get("pnl_fee", 0) or 0.0),
+        }
+
+    async def _get_binance_position_income_summary(
+        self,
+        symbol: str,
+        entry_time: float | None = None,
+    ) -> dict[str, float]:
+        if entry_time is None:
+            return {"funding_fee": 0.0, "trading_fee": 0.0}
+
+        since_ms = max(0, int(float(entry_time) * 1000) - 1000)
+        cache_key = (self._futures_symbol(symbol), since_ms)
+        cached = self._income_cache.get(cache_key)
+        now = time.time()
+        if cached and (now - float(cached.get("ts", 0.0))) < self._income_cache_ttl_seconds:
+            return dict(cached["value"])
+
+        funding_fee = 0.0
+        next_since = since_ms
+        limit = 100
+
+        while True:
+            batch = await self._retry(
+                self.futures_exchange.fetch_funding_history,
+                self._futures_symbol(symbol),
+                next_since,
+                limit,
+            )
+            if not batch:
+                break
+
+            last_timestamp = next_since
+            for item in batch:
+                timestamp = int(item.get("timestamp") or 0)
+                if timestamp < since_ms:
+                    continue
+                funding_fee += float(item.get("amount") or 0.0)
+                last_timestamp = max(last_timestamp, timestamp)
+
+            if len(batch) < limit or last_timestamp < next_since:
+                break
+            next_since = last_timestamp + 1
+            if next_since > int(now * 1000):
+                break
+
+        income = {"funding_fee": funding_fee, "trading_fee": 0.0}
+        self._income_cache[cache_key] = {"ts": now, "value": income}
+        return income
 
     # ── transfers ───────────────────────────────────────────────────
 
@@ -733,6 +834,13 @@ class DryRunClient(ExchangeClient):
 
     async def get_futures_positions(self) -> list[dict[str, Any]]:
         return []
+
+    async def get_position_income_summary(
+        self,
+        symbol: str,
+        entry_time: float | None = None,
+    ) -> dict[str, float]:
+        return {"funding_fee": 0.0, "trading_fee": 0.0}
 
     async def transfer_spot_to_futures(self, asset: str, amount: float) -> Any:
         self.logger.info(f"[DRY {self.name}] Transfer {amount} spot → futures")

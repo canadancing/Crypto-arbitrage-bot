@@ -91,6 +91,97 @@
         <div id="activity-list" class="log-list mono"></div>
       </div>
     </section>
+    </section>
+
+    <!-- ───── Earn/Loss Analysis ───── -->
+    <section class="bottom-grid"
+      style="margin-top: 24px; display: grid; grid-template-columns: 1fr 1.5fr 1.5fr; gap: 24px;">
+      <div class="card tall">
+        <h2 class="card-title">Win / Loss Metrics</h2>
+        <div class="analytics-metrics" id="earn-loss-metrics"
+          style="display: flex; flex-direction: column; gap: 12px; margin-top: 16px;">
+          <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+            <span class="label">Total Realized PnL</span>
+            <span class="value hero-value" id="el-total-pnl" style="font-size: 20px;">$0.00</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+              <span class="label">Wins</span>
+              <span class="value hero-value good" id="el-wins" style="font-size: 18px;">0</span>
+            </div>
+            <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+              <span class="label">Losses</span>
+              <span class="value hero-value bad" id="el-losses" style="font-size: 18px;">0</span>
+            </div>
+          </div>
+          <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+            <span class="label">Win Rate</span>
+            <span class="value hero-value" id="el-winrate" style="font-size: 18px;">0.00%</span>
+          </div>
+        </div>
+      </div>
+      <div class="card tall">
+        <div class="card-header-flex">
+          <h2 class="card-title">Loss Reasons Breakdown</h2>
+        </div>
+        <div id="loss-reasons-list" class="feed-list" style="margin-top: 16px;"></div>
+      </div>
+      <div class="card tall">
+        <div class="card-header-flex">
+          <h2 class="card-title">Coin Profit / Loss Ranking</h2>
+        </div>
+        <div id="coin-ranking-list" class="feed-list" style="margin-top: 16px;"></div>
+      </div>
+    </section>
+
+    <!-- ───── Optimization Insights ───── -->
+    <section class="bottom-grid" id="optimization-insights"
+      style="margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
+      <!-- Capital Efficiency Card -->
+      <div class="card">
+        <div class="card-header-flex">
+          <h2 class="card-title" style="color: var(--accent);">Optimization Insight: Capital Efficiency</h2>
+        </div>
+        <div class="analytics-metrics"
+          style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px;">
+          <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+            <span class="label">Avg Profit per Win</span>
+            <span class="value hero-value good" id="opt-avg-win" style="font-size: 18px;">$0.00</span>
+          </div>
+          <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+            <span class="label">Avg Loss per Loss</span>
+            <span class="value hero-value bad" id="opt-avg-loss" style="font-size: 18px;">$0.00</span>
+          </div>
+          <div class="pnl-chip card" style="text-align:center; padding: 12px; grid-column: span 2;">
+            <span class="label">Average ROI per Trade</span>
+            <span class="value hero-value" id="opt-avg-roi" style="font-size: 20px;">0.00%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Trade Duration Card -->
+      <div class="card">
+        <div class="card-header-flex">
+          <h2 class="card-title" style="color: var(--accent);">Optimization Insight: Trade Duration</h2>
+        </div>
+        <div class="analytics-metrics"
+          style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px;">
+          <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+            <span class="label">Avg Hold Time (Wins)</span>
+            <span class="value hero-value text" id="opt-hold-wins" style="font-size: 18px;">0h 0m</span>
+          </div>
+          <div class="pnl-chip card" style="text-align:center; padding: 12px;">
+            <span class="label">Avg Hold Time (Losses)</span>
+            <span class="value hero-value text" id="opt-hold-losses" style="font-size: 18px;">0h 0m</span>
+          </div>
+          <div class="pnl-chip card" style="text-align:center; padding: 12px; grid-column: span 2;">
+            <span class="label">Overall Avg Hold Time</span>
+            <span class="value hero-value" id="opt-hold-all" style="font-size: 20px; color: var(--cyan);">0h 0m</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
   </main>
 
 

@@ -73,6 +73,7 @@ class MultiExchangeBot:
         self._tg_offset: int | None = None
         self._heartbeat_interval = self.config.notifications.heartbeat_interval_minutes * 60
         self._last_heartbeat = 0.0
+        self._status_timeout_seconds = 12.0
 
     def _cred_status(self, value: str) -> str:
         if not value:
@@ -246,6 +247,16 @@ class MultiExchangeBot:
         else:
             await self.notifier.send(f"Unknown command: {cmd}. Try /help")
 
+    async def _safe_bot_status(self, bot: ExchangeArbBot) -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                bot.get_status_async(),
+                timeout=self._status_timeout_seconds,
+            )
+        except Exception as e:
+            self.logger.warning(f"Status snapshot fallback for {bot.name}: {e}")
+            return bot.get_status()
+
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeat messages."""
         # Grace period: wait 2 minutes after startup before sending any heartbeat
@@ -259,7 +270,7 @@ class MultiExchangeBot:
                     for bot in self.bots:
                         # Use async status which reads live exchange positions,
                         # not just the in-memory list (which is empty after restart).
-                        s = await bot.get_status_async()
+                        s = await self._safe_bot_status(bot)
                         n_positions = int(s.get("positions", 0))
                         max_pos = int(s.get("max_positions", 0))
                         daily_pnl = float(s.get("daily_pnl", 0) or 0)
@@ -280,7 +291,7 @@ class MultiExchangeBot:
         """Persist live status for the dashboard process."""
         while True:
             try:
-                exchanges = await asyncio.gather(*(b.get_status_async() for b in self.bots))
+                exchanges = await asyncio.gather(*(self._safe_bot_status(b) for b in self.bots))
                 payload = {
                     "dry_run": self.config.runtime.dry_run,
                     "exchanges": exchanges,

@@ -27,13 +27,38 @@ const els = {
   pnl7d: $("pnl-7d"),
   pnl30d: $("pnl-30d"),
   pnlCum: $("pnl-cum"),
-  chartCtx: $("earnings-chart")
+  chartCtx: $("earnings-chart"),
+
+  // Earn / Loss Analysis
+  elTotalPnl: $("el-total-pnl"),
+  elWins: $("el-wins"),
+  elLosses: $("el-losses"),
+  elWinrate: $("el-winrate"),
+  lossReasonsList: $("loss-reasons-list"),
+  coinRankingList: $("coin-ranking-list"),
+
+  // Optimization Insights
+  optAvgWin: $("opt-avg-win"),
+  optAvgLoss: $("opt-avg-loss"),
+  optAvgRoi: $("opt-avg-roi"),
+  optHoldWins: $("opt-hold-wins"),
+  optHoldLosses: $("opt-hold-losses"),
+  optHoldAll: $("opt-hold-all")
 };
 
 /* ===== Helpers ===== */
+function formatDuration(seconds) {
+  if (!seconds || seconds < 0) return "0h 0m";
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return `${hrs}h ${mins}m`;
+}
+
 function money(n) {
   if (typeof n !== "number" || !Number.isFinite(n)) return "-";
-  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const abs = Math.abs(n);
+  const formatted = abs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n < 0 ? `-$${formatted}` : `$${formatted}`;
 }
 function esc(s) {
   return String(s ?? "").replace(/[<>&"]/g, (c) =>
@@ -143,6 +168,25 @@ function update(data) {
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0ea5e9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 2px 4px rgba(14, 165, 233, 0.6)); position: relative; z-index: 1;"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"></path></svg>
       </div>`;
 
+    // Process recent errors for warning banner
+    let errorsHtml = "";
+    if (ex.recent_errors && ex.recent_errors.length > 0) {
+      const errorList = ex.recent_errors.map(err => {
+        const timeStr = new Date(err.time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return `<div style="font-size: 11px; margin-bottom: 2px;">• <strong>${esc(err.symbol)}</strong>: ${esc(err.message)} <span style="opacity:0.7">(${timeStr})</span></div>`;
+      }).join("");
+
+      errorsHtml = `
+        <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; color: #fca5a5;">
+          <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; margin-bottom: 6px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+            Recent Close Failures (Requires Manual Check)
+          </div>
+          ${errorList}
+        </div>
+      `;
+    }
+
     cardsHtml += `
       <div class="card exchange-card">
         <div class="card-header-flex" style="margin-bottom: 20px; align-items: center;">
@@ -155,6 +199,8 @@ function update(data) {
             <span class="status-pill down" style="font-family: var(--mono);">${ex.positions || 0} / ${ex.max_positions || 0} POS</span>
           </div>
         </div>
+        
+        ${errorsHtml}
         
         <div class="equity-showcase">
           <div class="equity-total">
@@ -554,8 +600,163 @@ async function loadStatus() {
   }
 }
 
+async function loadEarnLossAnalysis() {
+  if (!els.elTotalPnl) return;
+  try {
+    const res = await fetch("/api/history", { cache: "no-store" });
+    const data = await res.json();
+    const summary = data.summary || {};
+    const rows = data.rows || [];
+
+    els.elTotalPnl.textContent = (summary.realized_pnl >= 0 ? '+' : '') + money(summary.realized_pnl);
+    els.elTotalPnl.className = `value hero-value ${summary.realized_pnl >= 0 ? 'good' : 'bad'}`;
+
+    els.elWins.textContent = summary.wins || 0;
+    els.elLosses.textContent = summary.losses || 0;
+    els.elWinrate.textContent = (summary.win_rate || 0).toFixed(2) + '%';
+
+    // Breakdown loss reasons
+    const winners = rows.filter(r => (r.event === "CLOSE" || r.event === "CLOSE_FORCED") && Number(r.pnl || 0) > 0);
+    const losers = rows.filter(r => (r.event === "CLOSE" || r.event === "CLOSE_FORCED") && Number(r.pnl || 0) <= 0);
+    const reasonGroups = {};
+    for (const r of losers) {
+      const reason = r.close_reason || "Unknown";
+      if (!reasonGroups[reason]) reasonGroups[reason] = { count: 0, totalLoss: 0 };
+      reasonGroups[reason].count++;
+      reasonGroups[reason].totalLoss += Number(r.pnl || 0);
+    }
+
+    const sortedReasons = Object.entries(reasonGroups).sort((a, b) => a[1].totalLoss - b[1].totalLoss);
+
+    if (sortedReasons.length === 0) {
+      els.lossReasonsList.innerHTML = `<div class="feed-item" style="color:var(--text-3); text-align:center; justify-content:center;">No losses recorded yet</div>`;
+    } else {
+      els.lossReasonsList.innerHTML = sortedReasons.map(([reason, stats]) => `
+        <div class="feed-item" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; margin-bottom: 8px; background: rgba(239, 68, 68, 0.05); border: 1px solid rgba(239, 68, 68, 0.1); border-radius: 10px;">
+          <div class="info" style="display: flex; align-items: center; gap: 12px;">
+            <div style="display: flex; flex-direction: column; gap: 4px;">
+              <div class="primary" style="font-size: 14px; font-weight: 600; color: var(--text);">
+                ${esc(reason)}
+              </div>
+              <div class="secondary" style="font-size: 12px; color: var(--text-2);">
+                Occurred ${stats.count} time${stats.count !== 1 ? 's' : ''}
+              </div>
+            </div>
+          </div>
+          <div style="text-align: right;">
+            <div class="value bad" style="font-family: var(--mono); font-weight: 700; font-size: 15px;">
+              ${money(stats.totalLoss)}
+            </div>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    // Coin Profit / Loss Ranking
+    const allCloses = rows.filter(r => r.event === "CLOSE" || r.event === "CLOSE_FORCED");
+    const coinGroups = {};
+    for (const r of allCloses) {
+      const sym = r.symbol || "Unknown";
+      if (!coinGroups[sym]) coinGroups[sym] = { pnl: 0, trades: 0, exch: r.exchange || "" };
+      coinGroups[sym].pnl += Number(r.pnl || 0);
+      coinGroups[sym].trades++;
+    }
+
+    const sortedCoins = Object.entries(coinGroups).sort((a, b) => b[1].pnl - a[1].pnl);
+
+    if (sortedCoins.length === 0) {
+      els.coinRankingList.innerHTML = `<div class="feed-item" style="color:var(--text-3); text-align:center; justify-content:center;">No trades recorded yet</div>`;
+    } else {
+      els.coinRankingList.innerHTML = sortedCoins.map(([sym, stats]) => {
+        const pnl = stats.pnl;
+        const isGood = pnl >= 0;
+        return `
+          <div class="feed-item" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; margin-bottom: 8px; background: rgba(${isGood ? '16, 185, 129' : '239, 68, 68'}, 0.05); border: 1px solid rgba(${isGood ? '16, 185, 129' : '239, 68, 68'}, 0.1); border-radius: 10px;">
+            <div class="info" style="display: flex; align-items: center; gap: 12px;">
+              <div style="display: flex; flex-direction: column; gap: 4px;">
+                <div class="primary" style="display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 14px; color: var(--text);">
+                  <span class="exch-badge ${stats.exch}" style="font-size: 10px; padding: 2px 6px;">${stats.exch.toUpperCase()}</span>
+                  ${esc(sym)}
+                </div>
+                <div class="secondary" style="font-size: 12px; color: var(--text-2);">
+                  ${stats.trades} Trade${stats.trades !== 1 ? 's' : ''}
+                </div>
+              </div>
+            </div>
+            <div style="text-align: right;">
+              <div class="value ${isGood ? 'good' : 'bad'}" style="font-family: var(--mono); font-weight: 700; font-size: 15px;">
+                ${isGood ? '+' : ''}${money(pnl)}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    // Optimization Insights Calculations
+    if (els.optAvgWin) {
+      let totalWinAmount = 0, winCount = 0, winDurationList = [];
+      let totalLossAmount = 0, lossCount = 0, lossDurationList = [];
+      let totalDuration = 0, roiSum = 0, tradesWithSize = 0;
+
+      for (const r of allCloses) {
+        const pnl = Number(r.pnl || 0);
+        const duration = Number(r.hold_seconds || (r.close_time - r.entry_time) || 0);
+        const size = Number(r.size_usd || 0);
+
+        totalDuration += duration;
+        if (size > 0) {
+          roiSum += (pnl / size) * 100;
+          tradesWithSize++;
+        }
+
+        if (pnl > 0) {
+          totalWinAmount += pnl;
+          winCount++;
+          if (duration > 0) winDurationList.push(duration);
+        } else if (pnl < 0) {
+          totalLossAmount += pnl;
+          lossCount++;
+          if (duration > 0) lossDurationList.push(duration);
+        }
+      }
+
+      const avgWin = winCount > 0 ? totalWinAmount / winCount : 0;
+      const avgLoss = lossCount > 0 ? totalLossAmount / lossCount : 0;
+      const avgRoi = tradesWithSize > 0 ? roiSum / tradesWithSize : 0;
+
+      const avgHoldWin = winDurationList.length > 0 ? winDurationList.reduce((a, b) => a + b, 0) / winDurationList.length : 0;
+      const avgHoldLoss = lossDurationList.length > 0 ? lossDurationList.reduce((a, b) => a + b, 0) / lossDurationList.length : 0;
+      const avgHoldAll = allCloses.length > 0 ? totalDuration / allCloses.length : 0;
+
+      // Update DOM
+      els.optAvgWin.textContent = `+${money(avgWin)}`;
+      els.optAvgLoss.textContent = money(avgLoss);
+
+      els.optAvgRoi.textContent = `${avgRoi >= 0 ? '+' : ''}${avgRoi.toFixed(2)}%`;
+      els.optAvgRoi.style.color = avgRoi >= 0 ? 'var(--good)' : 'var(--bad)';
+
+      els.optHoldWins.textContent = formatDuration(avgHoldWin);
+      els.optHoldLosses.textContent = formatDuration(avgHoldLoss);
+      els.optHoldAll.textContent = formatDuration(avgHoldAll);
+
+      // Color-code loss holding time to highlight if holding losing trades too long
+      if (avgHoldLoss > avgHoldWin * 1.5) {
+        els.optHoldLosses.style.color = 'var(--warn)';
+      } else {
+        els.optHoldLosses.style.color = 'var(--text)';
+      }
+    }
+  } catch (e) {
+    console.error("Failed to load earn/loss analysis", e);
+  }
+}
+
 async function tick() {
-  await loadStatus();
+  await Promise.all([
+    loadStatus(),
+    loadEarnLossAnalysis()
+  ]);
 }
 
 tick();

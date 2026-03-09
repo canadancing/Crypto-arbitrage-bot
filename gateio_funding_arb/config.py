@@ -32,7 +32,17 @@ class RiskConfig:
     margin_ratio_threshold: float
     margin_ratio_target: float
     min_hold_time_seconds: int
-    funding_exit_threshold: float = 0.1
+    funding_interval_seconds: int = 28800
+    max_funding_windows_to_profit: int = 6
+    funding_exit_threshold: float = 0.02
+    profit_buffer_usd: float = 0.30
+    require_funding_fee_buffer: bool = False
+    stale_recycle_enabled: bool = False
+    target_roi_percent: float = 0.50
+    cautious_mode_trigger_percent: float = 2.5
+    cautious_max_position_size_percent: float = 15.0
+    cautious_min_net_edge_daily: float = 15.0
+    cautious_target_roi_percent: float = 1.0
 
 
 @dataclass

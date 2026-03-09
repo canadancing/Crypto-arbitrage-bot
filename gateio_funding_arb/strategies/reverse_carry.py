@@ -257,12 +257,20 @@ class ReverseCarryStrategy:
                     )
                 return None
 
+            actual_spot_price = spot_price
+            if spot_order and isinstance(spot_order, dict):
+                actual_spot_price = spot_order.get("average") or spot_order.get("price") or spot_price
+            
+            actual_futures_price = futures_price
+            if futures_order and isinstance(futures_order, dict):
+                actual_futures_price = futures_order.get("average") or futures_order.get("price") or futures_price
+
             position = {
                 "symbol": symbol,
                 "exchange": self.exchange_name,
                 "strategy": "reverse_carry",
-                "spot_entry_price": spot_price,
-                "futures_entry_price": futures_price,
+                "spot_entry_price": float(actual_spot_price),
+                "futures_entry_price": float(actual_futures_price),
                 "borrow_qty": borrow_qty,
                 "futures_qty": futures_qty,
                 "futures_base_qty": borrow_qty,
@@ -312,9 +320,15 @@ class ReverseCarryStrategy:
                     )
                 else:
                     raise  # unexpected — let outer handler log and return None
-            # Buy back spot to repay borrow
+            # Buy back spot to repay borrow. We need to buy enough to cover the original borrow_qty.
+            # On Gate.io, the borrow is tracked, but to successfully repay we need that exact amount in balance.
+            
+            # Since fees may be taken in the sold asset, first ensure we buy back enough to cover the loan.
+            # In a reverse carry, we sold borrow_qty. We must buy back borrow_qty.
             await self.client.buy_spot(symbol, borrow_qty)
-            # Repay
+            
+            # Now repay the loan. If we accrued interest, borrow_qty might not be enough to fully clear the loan,
+            # but repaying `borrow_qty` is the safe baseline. The exchange will usually take available balance.
             await self.client.repay_margin(base_asset, borrow_qty)
 
             spot_price = await self.client.get_spot_price(symbol)
@@ -322,14 +336,31 @@ class ReverseCarryStrategy:
 
             spot_pnl = (position["spot_entry_price"] - spot_price) * borrow_qty
             futures_pnl = (futures_price - position["futures_entry_price"]) * futures_base_qty
-            total_pnl = spot_pnl + futures_pnl - position.get("est_fees", 0)
+            
+            # Deduct standard round-trip fees (bid-ask spread and exchange API fees)
+            round_trip_estimate = position.get("est_fees", 0.0) * 2
+
+            # Add actual funding payments and trading fees accrued during the position's lifetime
+            last_pnl_status = position.get("last_status", {}).get("pnl", {})
+            pnl_fund = last_pnl_status.get("funding_fee", 0.0)
+            pnl_fee = last_pnl_status.get("trading_fee", 0.0)
+
+            total_pnl = spot_pnl + futures_pnl + pnl_fund + pnl_fee - round_trip_estimate
 
             self.logger.info(
                 f"[{self.exchange_name}] ✅ Closed {symbol}: "
-                f"PnL=${total_pnl:.2f} (spot=${spot_pnl:.2f}, fut=${futures_pnl:.2f})"
+                f"PnL=${total_pnl:.2f} (spot=${spot_pnl:.2f}, fut=${futures_pnl:.2f}, "
+                f"funding=${pnl_fund:.4f}, fees=${pnl_fee:.4f})"
             )
 
-            return {"symbol": symbol, "pnl": total_pnl, "spot_pnl": spot_pnl, "futures_pnl": futures_pnl}
+            return {
+                "symbol": symbol, 
+                "pnl": total_pnl, 
+                "spot_pnl": spot_pnl, 
+                "futures_pnl": futures_pnl + pnl_fund + pnl_fee,
+                "funding_fee": pnl_fund,
+                "trading_fee": pnl_fee,
+            }
 
         except Exception as e:
             self.logger.error(f"[{self.exchange_name}] Close error for {symbol}: {e}")

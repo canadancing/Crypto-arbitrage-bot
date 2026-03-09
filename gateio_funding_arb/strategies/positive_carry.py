@@ -182,12 +182,20 @@ class PositiveCarryStrategy:
                     )
                 return None
 
+            actual_spot_price = spot_price
+            if spot_order and isinstance(spot_order, dict):
+                actual_spot_price = spot_order.get("average") or spot_order.get("price") or spot_price
+
+            actual_futures_price = futures_price
+            if futures_order and isinstance(futures_order, dict):
+                actual_futures_price = futures_order.get("average") or futures_order.get("price") or futures_price
+
             position = {
                 "symbol": symbol,
                 "exchange": self.exchange_name,
                 "strategy": "positive_carry",
-                "spot_entry_price": spot_price,
-                "futures_entry_price": futures_price,
+                "spot_entry_price": float(actual_spot_price),
+                "futures_entry_price": float(actual_futures_price),
                 "spot_qty": spot_qty,
                 "futures_qty": futures_qty,
                 "futures_base_qty": spot_qty,
@@ -238,21 +246,51 @@ class PositiveCarryStrategy:
                     )
                 else:
                     raise  # unexpected — let outer handler log and return None
-            await self.client.sell_spot(symbol, spot_qty)
+            # Sell back spot. Fees on purchase might have reduced the base asset quantity slightly.
+            base_asset = self.client._base_asset(symbol)
+            spot_symbol = self.client._spot_symbol(symbol)
+            spot_balance = await self.client.get_spot_balance(base_asset)
+            actual_spot_qty = min(float(spot_qty), float(spot_balance.get("free", 0)))
+            actual_spot_qty = await self.client.round_qty(spot_symbol, actual_spot_qty)
+
+            if actual_spot_qty > 0:
+                await self.client.sell_spot(symbol, actual_spot_qty)
+            else:
+                self.logger.warning(
+                    f"[{self.exchange_name}] Spot balance for {symbol} is {actual_spot_qty} "
+                    f"(requested {spot_qty}). Skipping sell."
+                )
 
             spot_price = await self.client.get_spot_price(symbol)
             futures_price = await self.client.get_futures_price(symbol)
 
             spot_pnl = (spot_price - position["spot_entry_price"]) * spot_qty
             futures_pnl = (position["futures_entry_price"] - futures_price) * futures_base_qty
-            total_pnl = spot_pnl + futures_pnl - position.get("est_fees", 0)
+            
+            # Deduct standard round-trip fees (bid-ask spread and exchange API fees)
+            round_trip_estimate = position.get("est_fees", 0.0) * 2
+            
+            # Add actual funding payments and trading fees accrued during the position's lifetime
+            last_pnl_status = position.get("last_status", {}).get("pnl", {})
+            pnl_fund = last_pnl_status.get("funding_fee", 0.0)
+            pnl_fee = last_pnl_status.get("trading_fee", 0.0)
+
+            total_pnl = spot_pnl + futures_pnl + pnl_fund + pnl_fee - round_trip_estimate
 
             self.logger.info(
                 f"[{self.exchange_name}] ✅ Closed {symbol}: "
-                f"PnL=${total_pnl:.2f} (spot=${spot_pnl:.2f}, fut=${futures_pnl:.2f})"
+                f"PnL=${total_pnl:.2f} (spot=${spot_pnl:.2f}, fut=${futures_pnl:.2f}, "
+                f"funding=${pnl_fund:.4f}, fees=${pnl_fee:.4f})"
             )
 
-            return {"symbol": symbol, "pnl": total_pnl, "spot_pnl": spot_pnl, "futures_pnl": futures_pnl}
+            return {
+                "symbol": symbol, 
+                "pnl": total_pnl, 
+                "spot_pnl": spot_pnl, 
+                "futures_pnl": futures_pnl + pnl_fund + pnl_fee,
+                "funding_fee": pnl_fund,
+                "trading_fee": pnl_fee,
+            }
 
         except Exception as e:
             self.logger.error(f"[{self.exchange_name}] Close error for {symbol}: {e}")
